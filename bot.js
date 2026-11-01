@@ -1,3 +1,5 @@
+process.env.TZ = 'Europe/Moscow'; // Render по умолчанию работает в UTC — без этого "10:00" стало бы 13:00 по Москве
+
 require('dotenv').config();
 const fs = require('fs');
 const http = require('http');
@@ -35,6 +37,10 @@ const DAYS_TO_SHOW = 7;
 
 const DAY_NAMES = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 const MONTH_NAMES = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+
+const REMINDER_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const REMINDER_DAY_BEFORE_MIN = 24 * 60;
+const REMINDER_HOUR_BEFORE_MIN = 60;
 
 // userId -> { selected: number[], date? } — состояние текущей записи клиента
 const pendingBookings = new Map();
@@ -232,12 +238,15 @@ bot.action(/time:(\d{2}:\d{2})/, (ctx) => {
 
   saveBooking({
     clientName,
+    clientChatId: ctx.chat.id,
     services: serviceNames,
     totalDuration,
     totalPrice,
     date: pending.date,
     time,
     createdAt: new Date().toISOString(),
+    remindedDay: false,
+    remindedHour: false,
   });
 
   if (OWNER_CHAT_ID) {
@@ -266,8 +275,43 @@ bot.command('bookings', (ctx) => {
   ctx.reply(list);
 });
 
+function checkReminders() {
+  const bookings = loadBookings();
+  const now = new Date();
+  let changed = false;
+
+  for (const b of bookings) {
+    if (!b.clientChatId) continue; // старые заявки без сохранённого chat id
+
+    const apptTime = new Date(`${b.date}T${b.time}:00`);
+    const minutesUntil = (apptTime - now) / 60000;
+
+    if (!b.remindedDay && minutesUntil <= REMINDER_DAY_BEFORE_MIN && minutesUntil > REMINDER_HOUR_BEFORE_MIN) {
+      bot.telegram
+        .sendMessage(b.clientChatId, `⏰ Напоминание: завтра в ${b.time} у тебя запись (${b.services}). Ждём!`)
+        .catch((err) => console.error('Не удалось отправить напоминание (за день):', err.message));
+      b.remindedDay = true;
+      changed = true;
+    }
+
+    if (!b.remindedHour && minutesUntil <= REMINDER_HOUR_BEFORE_MIN && minutesUntil > 0) {
+      bot.telegram
+        .sendMessage(b.clientChatId, `⏰ Уже через час, в ${b.time}, ждём тебя: ${b.services}.`)
+        .catch((err) => console.error('Не удалось отправить напоминание (за час):', err.message));
+      b.remindedHour = true;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2));
+  }
+}
+
 bot.launch();
 console.log('Бот запущен');
+
+setInterval(checkReminders, REMINDER_CHECK_INTERVAL_MS);
 
 // Render.com требует, чтобы веб-сервис слушал порт — без этого он решит, что процесс умер.
 // Этот же адрес потом будет пинговать внешний "будильник", чтобы бот не засыпал.
