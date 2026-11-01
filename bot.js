@@ -36,7 +36,7 @@ const DAYS_TO_SHOW = 7;
 const DAY_NAMES = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 const MONTH_NAMES = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
 
-// userId -> { serviceIndex, date }, пока клиент не закончил выбор
+// userId -> { selected: number[], date? } — состояние текущей записи клиента
 const pendingBookings = new Map();
 
 function loadBookings() {
@@ -61,6 +61,17 @@ function formatDateLabel(date) {
   return `${DAY_NAMES[date.getDay()]}, ${date.getDate()} ${MONTH_NAMES[date.getMonth()]}`;
 }
 
+function timeToMin(time) {
+  const [h, m] = time.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function minToTime(min) {
+  const hh = String(Math.floor(min / 60)).padStart(2, '0');
+  const mm = String(min % 60).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
 function getWorkDates(count) {
   const dates = [];
   const cursor = new Date();
@@ -76,22 +87,37 @@ function getWorkDates(count) {
   return dates;
 }
 
-function getFreeSlots(dateIso) {
-  const bookings = loadBookings();
-  const takenTimes = new Set(bookings.filter((b) => b.date === dateIso).map((b) => b.time));
+function getPending(userId) {
+  if (!pendingBookings.has(userId)) {
+    pendingBookings.set(userId, { selected: [] });
+  }
+  return pendingBookings.get(userId);
+}
+
+function getTotals(selected) {
+  const services = selected.map((i) => SERVICES[i]);
+  const totalDuration = services.reduce((sum, s) => sum + s.duration, 0);
+  const totalPrice = services.reduce((sum, s) => sum + s.price, 0);
+  return { services, totalDuration, totalPrice };
+}
+
+// Свободен ли слот [start, start+duration) на этот день с учётом уже занятых интервалов
+function getFreeSlots(dateIso, duration) {
+  const busy = loadBookings()
+    .filter((b) => b.date === dateIso)
+    .map((b) => ({ start: timeToMin(b.time), end: timeToMin(b.time) + b.totalDuration }));
 
   const isToday = dateIso === toIsoDate(new Date());
   const now = new Date();
   const nowMin = now.getHours() * 60 + now.getMinutes();
 
   const slots = [];
-  for (let min = WORK_START_MIN; min < WORK_END_MIN; min += SLOT_STEP_MIN) {
-    if (isToday && min <= nowMin) continue;
+  for (let start = WORK_START_MIN; start + duration <= WORK_END_MIN; start += SLOT_STEP_MIN) {
+    if (isToday && start <= nowMin) continue;
 
-    const hh = String(Math.floor(min / 60)).padStart(2, '0');
-    const mm = String(min % 60).padStart(2, '0');
-    const time = `${hh}:${mm}`;
-    if (!takenTimes.has(time)) slots.push(time);
+    const end = start + duration;
+    const overlaps = busy.some((b) => start < b.end && b.start < end);
+    if (!overlaps) slots.push(minToTime(start));
   }
 
   return slots;
@@ -103,14 +129,27 @@ function chunk(array, size) {
   return rows;
 }
 
+function renderServiceButtons(selected) {
+  return SERVICES.map((s, i) => {
+    const mark = selected.includes(i) ? '✅ ' : '';
+    return [Markup.button.callback(`${mark}${s.emoji} ${s.name} — ${s.price}₽ (${s.duration} мин)`, `toggle:${i}`)];
+  });
+}
+
+function renderServiceMessage(selected) {
+  if (selected.length === 0) {
+    return 'Выбери одну или несколько услуг:';
+  }
+  const { services, totalDuration, totalPrice } = getTotals(selected);
+  const names = services.map((s) => s.name).join(', ');
+  return `Выбери одну или несколько услуг:\n\n✅ Выбрано: ${names}\nИтого: ${totalDuration} мин, ${totalPrice}₽`;
+}
+
 bot.command('start', (ctx) => {
+  pendingBookings.set(ctx.from.id, { selected: [] });
   ctx.reply(
-    '👋 Привет! Выбери услугу:',
-    Markup.inlineKeyboard(
-      SERVICES.map((s, i) => [
-        Markup.button.callback(`${s.emoji} ${s.name} — ${s.price}₽ (${s.duration} мин)`, `svc:${i}`),
-      ])
-    )
+    `👋 Привет! ${renderServiceMessage([])}`,
+    Markup.inlineKeyboard(renderServiceButtons([]))
   );
 });
 
@@ -118,17 +157,37 @@ bot.command('myid', (ctx) => {
   ctx.reply(`Твой chat id: ${ctx.chat.id}`);
 });
 
-bot.action(/svc:(\d+)/, (ctx) => {
-  const serviceIndex = Number(ctx.match[1]);
-  const service = SERVICES[serviceIndex];
-  pendingBookings.set(ctx.from.id, { serviceIndex });
+bot.action(/toggle:(\d+)/, (ctx) => {
+  const index = Number(ctx.match[1]);
+  const pending = getPending(ctx.from.id);
+
+  if (pending.selected.includes(index)) {
+    pending.selected = pending.selected.filter((i) => i !== index);
+  } else {
+    pending.selected.push(index);
+  }
+
+  const rows = renderServiceButtons(pending.selected);
+  if (pending.selected.length > 0) {
+    rows.push([Markup.button.callback('➡️ Готово, выбрать время', 'done')]);
+  }
+
+  ctx.editMessageText(renderServiceMessage(pending.selected), Markup.inlineKeyboard(rows));
+});
+
+bot.action('done', (ctx) => {
+  const pending = getPending(ctx.from.id);
+  if (pending.selected.length === 0) {
+    return ctx.answerCbQuery('Выбери хотя бы одну услугу');
+  }
 
   const dateButtons = getWorkDates(DAYS_TO_SHOW).map((date) =>
     Markup.button.callback(formatDateLabel(date), `date:${toIsoDate(date)}`)
   );
 
+  const { totalDuration, totalPrice } = getTotals(pending.selected);
   ctx.editMessageText(
-    `${service.emoji} Услуга: ${service.name} — ${service.price}₽\nВыбери день:`,
+    `${renderServiceMessage(pending.selected)}\n\nВыбери день:`,
     Markup.inlineKeyboard(chunk(dateButtons, 2))
   );
 });
@@ -136,22 +195,22 @@ bot.action(/svc:(\d+)/, (ctx) => {
 bot.action(/date:(\d{4}-\d{2}-\d{2})/, (ctx) => {
   const dateIso = ctx.match[1];
   const pending = pendingBookings.get(ctx.from.id);
-  if (!pending) {
+  if (!pending || pending.selected.length === 0) {
     return ctx.answerCbQuery('Начни сначала: /start');
   }
 
   pending.date = dateIso;
-  const service = SERVICES[pending.serviceIndex];
-  const freeSlots = getFreeSlots(dateIso);
+  const { totalDuration } = getTotals(pending.selected);
+  const freeSlots = getFreeSlots(dateIso, totalDuration);
 
   if (freeSlots.length === 0) {
-    return ctx.editMessageText('😔 На этот день свободных окон не осталось. Выбери другой день через /start.');
+    return ctx.editMessageText('😔 На этот день нет окна нужной длительности. Выбери другой день через /start.');
   }
 
   const timeButtons = freeSlots.map((time) => Markup.button.callback(time, `time:${time}`));
 
   ctx.editMessageText(
-    `${service.emoji} Услуга: ${service.name}\nДень: ${dateIso}\nВыбери время:`,
+    `${renderServiceMessage(pending.selected)}\n\nДень: ${dateIso}\nВыбери время:`,
     Markup.inlineKeyboard(chunk(timeButtons, 3))
   );
 });
@@ -163,17 +222,19 @@ bot.action(/time:(\d{2}:\d{2})/, (ctx) => {
     return ctx.answerCbQuery('Начни сначала: /start');
   }
 
-  const service = SERVICES[pending.serviceIndex];
+  const { services, totalDuration, totalPrice } = getTotals(pending.selected);
+  const serviceNames = services.map((s) => s.name).join(', ');
   const clientName = ctx.from.username ? `@${ctx.from.username}` : ctx.from.first_name;
 
   ctx.editMessageText(
-    `✅ Заявка отправлена!\n${service.emoji} Услуга: ${service.name} — ${service.price}₽\n📅 ${pending.date} в ${time}\n💈 Барбер скоро свяжется с тобой.`
+    `✅ Заявка отправлена!\nУслуги: ${serviceNames}\nИтого: ${totalDuration} мин, ${totalPrice}₽\n📅 ${pending.date} в ${time}\n💈 Барбер скоро свяжется с тобой.`
   );
 
   saveBooking({
     clientName,
-    service: service.name,
-    price: service.price,
+    services: serviceNames,
+    totalDuration,
+    totalPrice,
     date: pending.date,
     time,
     createdAt: new Date().toISOString(),
@@ -182,7 +243,7 @@ bot.action(/time:(\d{2}:\d{2})/, (ctx) => {
   if (OWNER_CHAT_ID) {
     bot.telegram.sendMessage(
       OWNER_CHAT_ID,
-      `🔔 Новая заявка!\n👤 Клиент: ${clientName}\n${service.emoji} Услуга: ${service.name} — ${service.price}₽\n📅 ${pending.date} в ${time}`
+      `🔔 Новая заявка!\n👤 Клиент: ${clientName}\nУслуги: ${serviceNames}\nИтого: ${totalDuration} мин, ${totalPrice}₽\n📅 ${pending.date} в ${time}`
     );
   }
 
@@ -200,7 +261,7 @@ bot.command('bookings', (ctx) => {
   }
 
   const list = bookings
-    .map((b, i) => `${i + 1}. 👤 ${b.clientName} — ${b.service} (${b.price}₽), 📅 ${b.date} ${b.time}`)
+    .map((b, i) => `${i + 1}. 👤 ${b.clientName} — ${b.services} (${b.totalPrice}₽, ${b.totalDuration} мин), 📅 ${b.date} ${b.time}`)
     .join('\n');
   ctx.reply(list);
 });
