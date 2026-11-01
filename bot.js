@@ -1,14 +1,30 @@
 require('dotenv').config();
+const fs = require('fs');
 const { Telegraf, Markup } = require('telegraf');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
+const BOOKINGS_FILE = 'bookings.json';
 
 const SERVICES = ['Стрижка', 'Борода', 'Стрижка + борода'];
 const SLOTS = ['Завтра, 12:00', 'Завтра, 15:00', 'Послезавтра, 11:00', 'Послезавтра, 17:00'];
 
 // userId -> выбранная услуга, пока клиент не выбрал время
 const pendingBookings = new Map();
+
+function loadBookings() {
+  try {
+    return JSON.parse(fs.readFileSync(BOOKINGS_FILE, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
+function saveBooking(booking) {
+  const bookings = loadBookings();
+  bookings.push(booking);
+  fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2));
+}
 
 bot.command('start', (ctx) => {
   ctx.reply(
@@ -40,6 +56,8 @@ bot.action(/slot:(.+)/, (ctx) => {
   const clientName = ctx.from.username ? `@${ctx.from.username}` : ctx.from.first_name;
   ctx.editMessageText(`Заявка отправлена!\nУслуга: ${service}\nВремя: ${slot}\nБарбер скоро свяжется с тобой.`);
 
+  saveBooking({ clientName, service, slot, createdAt: new Date().toISOString() });
+
   if (OWNER_CHAT_ID) {
     bot.telegram.sendMessage(
       OWNER_CHAT_ID,
@@ -48,6 +66,22 @@ bot.action(/slot:(.+)/, (ctx) => {
   }
 
   pendingBookings.delete(ctx.from.id);
+});
+
+bot.command('bookings', (ctx) => {
+  if (String(ctx.chat.id) !== OWNER_CHAT_ID) {
+    return;
+  }
+
+  const bookings = loadBookings();
+  if (bookings.length === 0) {
+    return ctx.reply('Заявок пока нет.');
+  }
+
+  const list = bookings
+    .map((b, i) => `${i + 1}. ${b.clientName} — ${b.service}, ${b.slot}`)
+    .join('\n');
+  ctx.reply(list);
 });
 
 bot.launch();
