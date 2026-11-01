@@ -1,5 +1,6 @@
 require('dotenv').config();
 const fs = require('fs');
+const http = require('http');
 const { Telegraf, Markup } = require('telegraf');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -86,3 +87,10 @@ bot.command('bookings', (ctx) => {
 
 bot.launch();
 console.log('Бот запущен');
+
+// Render.com требует, чтобы веб-сервис слушал порт — без этого он решит, что процесс умер.
+// Этот же адрес потом будет пинговать внешний "будильник", чтобы бот не засыпал.
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => res.end('Бот жив')).listen(PORT, () => {
+  console.log(`Health check слушает порт ${PORT}`);
+});
